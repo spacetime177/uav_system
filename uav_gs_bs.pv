@@ -1,0 +1,186 @@
+(* uav_gs_gs_bs.pv
+   3-entity protocol: UAV <-> GS with BS as key distribution center (KDC)
+   - BS generates fresh session key 'ks' for UAV-GS
+   - BS signs the key package and provides encrypted copies for both UAV and GS
+   - UAV and GS mutually authenticate using nonces and signatures
+   - Formalized for ProVerif (symbolic Dolev-Yao model)
+*)
+
+(* --- Public channel --- *)
+free c: channel.
+
+(* --- Pairing func --- *)
+fun pair(bitstring, bitstring): bitstring.
+fun fst(bitstring): bitstring.
+fun snd(bitstring): bitstring.
+
+(* --- Symmetric encryption (session encryption) --- *)
+fun senc(bitstring, bitstring): bitstring.
+reduc forall m:bitstring, k:bitstring; sdec(senc(m,k),k) = m.
+
+(* --- Asymmetric encryption for distributing ks --- *)
+fun pk(bitstring): bitstring.         (* public key from a private key *)
+fun aenc(bitstring, bitstring): bitstring.
+reduc forall m:bitstring, sk:bitstring; adec(aenc(m, pk(sk)), sk) = m.
+
+(* --- Signatures --- *)
+fun sign(bitstring, bitstring): bitstring.
+reduc forall m:bitstring, sk:bitstring; verify(sign(m, sk), pk(sk)) = m.
+
+(* --- Identities --- *)
+free UAV_ID: bitstring.
+free GS_ID:  bitstring.
+free BS_ID:  bitstring.
+
+(* --- Long-term private keys (kept secret) --- *)
+free skU: bitstring [private].  (* UAV private key *)
+free skG: bitstring [private].  (* GS private key *)
+free skB: bitstring [private].  (* BS private key *)
+
+(* --- Events for correspondence/freshness --- *)
+event begin_uav_auth(bitstring).
+event end_uav_auth(bitstring).
+event begin_gs_auth(bitstring).
+event end_gs_auth(bitstring).
+event begin_bs_auth(bitstring).
+event end_bs_auth(bitstring).
+event key_generated(bitstring).    (* emitted by BS when ks created *)
+
+(* ------------------- UAV Process ------------------- *)
+let UAV =
+  (* UAV creates fresh nonce and timestamp *)
+  new n_u: bitstring;
+  new t_u: bitstring;
+
+  (* Step 1: UAV -> GS : UAV_ID, n_u, t_u *)
+  out(c, (UAV_ID, n_u, t_u));
+
+  (* Wait for GS -> UAV message containing BS's package for UAV *)
+  in(c, (gs_id:bitstring, recv_nu:bitstring, n_g:bitstring, enc_ks_for_uav:bitstring, sig_b:bitstring));
+
+  (* Verify BS signature and extract the signed structure *)
+  let check_b = verify(sig_b, pk(skB)) in
+  (* Expect BS to have signed: pair(uav_id, pair(gs_id, pair(n_u, pair(n_g, pair(enc_ks_for_uav, enc_ks_for_gs)))))*)
+     (* UAV only receives enc_ks_for_uav and signature; GS receives enc_ks_for_gs as well in the package. *)
+  if check_b = pair(UAV_ID, pair(gs_id, pair(recv_nu, pair(n_g, pair(enc_ks_for_uav,sig_b))))) then
+    if recv_nu = n_u then
+      (* Decrypt session key encrypted for UAV *)
+      let ks = adec(enc_ks_for_uav, skU) in
+
+      (* UAV records begin event *)
+      event begin_uav_auth(UAV_ID);
+
+      (* Send authenticated application data encrypted by ks and signed by UAV *)
+      new data: bitstring;
+      let ciphertext = senc(data, ks) in
+      let sig_u = sign(pair(n_g, ciphertext), skU) in
+
+      (* UAV -> GS : sig_u, ciphertext *)
+      out(c, (sig_u, ciphertext));
+
+      (* end event *)
+      event end_uav_auth(UAV_ID)
+    else
+      0
+  else
+    0.
+
+(* ------------------- Ground Station (GS) Process ------------------- *)
+let GroundStation =
+  (* Step 1 receive: UAV_ID, n_u, t_u *)
+  in(c, (uav_id:bitstring, n_u:bitstring, t_u:bitstring));
+
+  (* GS generates its own nonce for freshness *)
+  new n_g: bitstring;
+
+  (* Step 2: GS -> BS : GS requests a session key for (UAV,GS) with nonce n_g *)
+  out(c, (GS_ID, uav_id, n_u, n_g));
+
+  (* Wait for BS response with enc_ks_for_gs, enc_ks_for_uav, signature *)
+  in(c, (bs_id:bitstring, uav_id2:bitstring, gs_id2:bitstring, enc_ks_for_gs:bitstring, enc_ks_for_uav:bitstring, sig_b:bitstring));
+
+  (* Verify BS signature *)
+  let check_b = verify(sig_b, pk(skB)) in
+
+  (* Expected signed structure: pair(uav_id, pair(gs_id, pair(n_u, pair(n_g, pair(enc_ks_for_uav, enc_ks_for_gs))))) *)
+  if check_b = pair(uav_id2, pair(gs_id2, pair(n_u, pair(n_g, pair(enc_ks_for_uav, enc_ks_for_gs))))) then
+    if uav_id2 = uav_id && gs_id2 = GS_ID then
+
+      (* Decrypt the session key encrypted for GS *)
+      let ks = adec(enc_ks_for_gs, skG) in
+
+      (* GS records key generation/usage (begin event for GS side) *)
+      event begin_gs_auth(GS_ID);
+
+      (* Forward to UAV the package intended for UAV (enc_ks_for_uav and BS signature) *)
+      out(c, (GS_ID, n_u, n_g, enc_ks_for_uav, sig_b));
+
+      (* Wait for UAV's authenticated data *)
+      in(c, (sig_u:bitstring, ciphertext:bitstring));
+
+      (* Verify UAV signature to retrieve (n_g, ciphertext) *)
+      let check_u = verify(sig_u, pk(skU)) in
+      if check_u = pair(n_g, ciphertext) then
+        (* Decrypt application ciphertext using ks *)
+        let received = sdec(ciphertext, ks) in
+        event end_gs_auth(GS_ID);
+        0
+      else
+        0
+    else
+      0
+  else
+    0.
+
+(* ------------------- Base Station (BS) Process ------------------- *)
+let BaseStation =
+  (* Wait for GS request: GS_ID, uav_id, n_u, n_g *)
+  in(c, (gs_id_req:bitstring, uav_id_req:bitstring, n_u_req:bitstring, n_g_req:bitstring));
+
+  (* BS generates fresh session key for (UAV,GS) *)
+  new ks: bitstring;
+  event key_generated(ks);
+  event begin_bs_auth(BS_ID);
+
+  (* Encrypt ks separately for UAV and GS *)
+  let enc_ks_for_uav = aenc(ks, pk(skU)) in
+  let enc_ks_for_gs  = aenc(ks, pk(skG)) in
+
+  (* BS signs the whole package so both parties can trust source and parameters:
+     sign( pair(uav_id, pair(gs_id, pair(n_u, pair(n_g, pair(enc_ks_for_uav, enc_ks_for_gs))))) , skB) *)
+  let sig_b = sign(pair(uav_id_req, pair(gs_id_req, pair(n_u_req, pair(n_g_req, pair(enc_ks_for_uav, enc_ks_for_gs))))), skB) in
+
+  (* Send back to GS: BS_ID, uav_id, gs_id, enc_ks_for_gs, enc_ks_for_uav, signature *)
+  out(c, (BS_ID, uav_id_req, gs_id_req, enc_ks_for_gs, enc_ks_for_uav, sig_b));
+
+  event end_bs_auth(BS_ID);
+  0.
+
+
+
+
+(* ------------------- Security Queries (correspondences & freshness) ------------------- *)
+
+(* Injective correspondences to catch replays *)
+query x:bitstring; inj-event(end_uav_auth(x)) ==> event(begin_uav_auth(x)).
+query x:bitstring; inj-event(end_gs_auth(x)) ==> event(begin_gs_auth(x)).
+query x:bitstring; inj-event(end_bs_auth(x)) ==> event(begin_bs_auth(x)).
+
+(* Non-injective correspondences (redundant/explicit) *)
+query x:bitstring; event(end_uav_auth(x)) ==> event(begin_uav_auth(x)).
+query x:bitstring; event(end_gs_auth(x)) ==> event(begin_gs_auth(x)).
+query x:bitstring; event(end_bs_auth(x)) ==> event(begin_bs_auth(x)).
+
+(* Freshness / replay binding: if GS finishes, the session key must have been freshly generated by BS *)
+query ks:bitstring; event(end_gs_auth(GS_ID)) ==> event(key_generated(ks)).
+
+(* Identity-binding correspondences  for MITM attack check *)
+query event(end_uav_auth(UAV_ID)) ==> event(begin_gs_auth(GS_ID)).
+query event(end_gs_auth(GS_ID)) ==> event(begin_uav_auth(UAV_ID)).
+query event(end_gs_auth(GS_ID)) ==> event(begin_bs_auth(BS_ID)).
+
+
+(* ------------------- Main Process------------------- *)
+process
+  (!UAV | !GroundStation | !BaseStation)
+
