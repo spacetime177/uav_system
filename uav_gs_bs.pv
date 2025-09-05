@@ -1,5 +1,5 @@
-(* uav_gs_gs_bs.pv
-   3-entity protocol: UAV <-> GS with BS as key distribution center (KDC)
+(* uav_gs_bs.pv
+   3-entity protocol: UAV <-> GS with BS as key distributer
    - BS generates fresh session key 'ks' for UAV-GS
    - BS signs the key package and provides encrypted copies for both UAV and GS
    - UAV and GS mutually authenticate using nonces and signatures
@@ -35,6 +35,8 @@ reduc forall m:bitstring, sk:bitstring; verify(sign(m, sk), pk(sk)) = m.
 free UAV_ID: bitstring.
 free GS_ID:  bitstring.
 free BS_ID:  bitstring.
+free ACK: bitstring.
+
 
 (* --- Long-term private keys (kept secret) --- *)
 free skU: bitstring [private].  (* UAV private key *)
@@ -49,6 +51,7 @@ event end_gs_auth(bitstring).
 event begin_bs_auth(bitstring).
 event end_bs_auth(bitstring).
 event key_generated(bitstring).    (* emitted by BS when ks created *)
+event gs_acknowledge(bitstring).
 
 (* ================================================= *)
 (* ------------------- UAV Process ----------------- *)
@@ -79,7 +82,13 @@ let UAV =
 
       (* Step 6: UAV -> BS *)
       out(c, (sig_u, ciphertext));
-      event end_uav_auth(UAV_ID)
+      
+      (* Step 9: Wait for GS acknowledgment *)
+      in(c, (ack:bitstring));
+      let check_ack = verify(ack, pk(skG)) in
+        if check_ack = pair(ACK, n_u) then
+            event end_uav_auth(UAV_ID)
+        else 0
     else 0
   else 0.
 
@@ -139,6 +148,10 @@ let GroundStation =
     let check_u = verify(sig_u, pk(skU)) in
     if check_u = pair(n_u, ciphertext) then
       let received = sdec(ciphertext, ks) in
+      (*  Step 9: GS -> UAV acknowledgment *)
+      let ack = sign(pair(ACK, n_u), skG) in
+      out(c, ack);
+      event gs_acknowledge(GS_ID);
       event end_gs_auth(GS_ID);
       0
     else 0
